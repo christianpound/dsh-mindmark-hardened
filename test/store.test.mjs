@@ -35,7 +35,7 @@ after(() => {
 let fileCounter = 0
 function tempFile(label) {
   fileCounter += 1
-  return path.join(tempRoot, `${label}-${fileCounter}`, 'annotations', 'state.json')
+  return path.join(tempRoot, `${label}-${fileCounter}`, 'annotations-hardened', 'state.json')
 }
 
 function readState(filePath) {
@@ -55,14 +55,14 @@ function makeAnnotation(overrides = {}) {
   }
 }
 
-test('resolveStatePath resolves $DSH_HOME/annotations/state.json with a ~/.dsh fallback', () => {
+test('resolveStatePath resolves the hardened namespace with a ~/.dsh fallback', () => {
   const home = path.join(tempRoot, 'dsh-home')
-  assert.equal(resolveStatePath({ DSH_HOME: home }), path.join(home, 'annotations', 'state.json'))
+  assert.equal(resolveStatePath({ DSH_HOME: home }), path.join(home, 'annotations-hardened', 'state.json'))
   assert.equal(
     resolveStatePath({ DSH_HOME: '   ' }),
-    path.join(os.homedir(), '.dsh', 'annotations', 'state.json'),
+    path.join(os.homedir(), '.dsh', 'annotations-hardened', 'state.json'),
   )
-  assert.equal(resolveStatePath({}), path.join(os.homedir(), '.dsh', 'annotations', 'state.json'))
+  assert.equal(resolveStatePath({}), path.join(os.homedir(), '.dsh', 'annotations-hardened', 'state.json'))
 })
 
 test('normalizeState never throws and returns a safe empty document for garbage', () => {
@@ -71,7 +71,7 @@ test('normalizeState never throws and returns a safe empty document for garbage'
   }
 })
 
-test('normalizeState drops malformed records, truncates context and keeps extra fields', () => {
+test('normalizeState drops malformed records, truncates context and drops extra fields', () => {
   const state = normalizeState({
     version: 1,
     sessions: {
@@ -103,7 +103,7 @@ test('normalizeState drops malformed records, truncates context and keeps extra 
   const annotations = state.sessions.sess_ok.annotations
   assert.equal(annotations.length, 2)
   assert.equal(annotations[0].id, 'ann_ok')
-  assert.equal(annotations[0].extra, 'keep-me')
+  assert.equal(annotations[0].extra, undefined)
   assert.equal(annotations[1].prefix.length, MAX_CONTEXT_LENGTH)
   assert.equal(annotations[1].suffix.length, MAX_CONTEXT_LENGTH)
   assert.equal(annotations[1].rootSelector.length, MAX_ROOT_SELECTOR_LENGTH)
@@ -147,7 +147,7 @@ test('validateAnnotationInput fills defaults and truncates oversized hints', () 
     rootSelector: 'r'.repeat(400),
     createdAt: '2026-11-03T02:20:00.000Z',
   })
-  assert.equal(long.id.length, MAX_ID_LENGTH)
+  assert.match(long.id, /^ann_[0-9a-f-]{36}$/)
   assert.equal(long.prefix.length, MAX_CONTEXT_LENGTH)
   assert.equal(long.suffix.length, MAX_CONTEXT_LENGTH)
   assert.equal(long.rootSelector.length, MAX_ROOT_SELECTOR_LENGTH)
@@ -188,13 +188,13 @@ test('AnnotationStore lists oldest first, isolates sessions and dedupes identica
 
   const first = store.add('sess_a', makeAnnotation({ id: 'ann_first', createdAt: '2026-11-03T01:00:00.000Z' }))
   assert.equal(first.deduped, false)
-  assert.deepEqual(store.list('sess_a').map(annotation => annotation.id), ['ann_first'])
+  assert.deepEqual(store.list('sess_a').map(annotation => annotation.id), [first.annotation.id])
 
-  store.add(
+  const second = store.add(
     'sess_a',
     makeAnnotation({ id: 'ann_second', quote: '另一段', createdAt: '2026-11-03T03:00:00.000Z' }),
   )
-  assert.deepEqual(store.list('sess_a').map(annotation => annotation.id), ['ann_first', 'ann_second'])
+  assert.deepEqual(store.list('sess_a').map(annotation => annotation.id), [first.annotation.id, second.annotation.id])
   assert.deepEqual(store.list('sess_b'), [], 'sessions are isolated')
 
   // Same (style, quote, prefix, suffix): refreshed in place, moved to the end.
@@ -203,11 +203,11 @@ test('AnnotationStore lists oldest first, isolates sessions and dedupes identica
     makeAnnotation({ id: 'ann_third', createdAt: '2026-11-04T05:00:00.000Z' }),
   )
   assert.equal(refreshed.deduped, true)
-  assert.equal(refreshed.annotation.id, 'ann_first')
+  assert.equal(refreshed.annotation.id, first.annotation.id)
   assert.equal(refreshed.annotation.createdAt, '2026-11-04T05:00:00.000Z')
   const list = store.list('sess_a')
   assert.equal(list.length, 2)
-  assert.deepEqual(list.map(annotation => annotation.id), ['ann_second', 'ann_first'])
+  assert.deepEqual(list.map(annotation => annotation.id), [second.annotation.id, first.annotation.id])
 })
 
 test('AnnotationStore caps one session at 300 annotations, dropping the oldest', () => {
@@ -228,14 +228,14 @@ test('AnnotationStore caps one session at 300 annotations, dropping the oldest',
 test('remove and clear drop empty session keys instead of leaving residue', () => {
   const file = tempFile('residue')
   const store = new AnnotationStore(file)
-  store.add('sess_remove', makeAnnotation({ id: 'ann_a' }))
-  store.add('sess_remove', makeAnnotation({ id: 'ann_b', quote: '第二段' }))
+  const a = store.add('sess_remove', makeAnnotation({ id: 'ann_a' })).annotation.id
+  const b = store.add('sess_remove', makeAnnotation({ id: 'ann_b', quote: '第二段' })).annotation.id
 
-  assert.equal(store.remove('sess_remove', ['ann_a', 'missing']), 1)
+  assert.equal(store.remove('sess_remove', [a, 'missing']), 1)
   assert.equal(store.list('sess_remove').length, 1)
   assert.deepEqual(Object.keys(readState(file).sessions), ['sess_remove'])
 
-  assert.equal(store.remove('sess_remove', ['ann_b']), 1)
+  assert.equal(store.remove('sess_remove', [b]), 1)
   assert.deepEqual(store.list('sess_remove'), [])
   assert.deepEqual(readState(file).sessions, {}, 'the empty session key is written out')
 
@@ -252,18 +252,18 @@ test('annotations survive a full store round-trip in a temp dir', () => {
   const file = tempFile('roundtrip')
   const store = new AnnotationStore(file)
   const record = makeAnnotation({ id: 'ann_persisted', quote: '会被保存' })
-  store.add('sess_rt', record)
+  const saved = store.add('sess_rt', record).annotation
   assert.ok(fs.existsSync(file))
 
   const reopened = new AnnotationStore(file)
   const annotations = reopened.list('sess_rt')
   assert.equal(annotations.length, 1)
-  for (const [key, value] of Object.entries(record)) {
+  for (const [key, value] of Object.entries(saved)) {
     assert.deepEqual(annotations[0][key], value)
   }
   const onDisk = readState(file)
   assert.equal(onDisk.version, 2)
-  assert.equal(onDisk.sessions.sess_rt.annotations[0].id, 'ann_persisted')
+  assert.equal(onDisk.sessions.sess_rt.annotations[0].id, saved.id)
   assert.ok(
     fs.readdirSync(path.dirname(file)).every(name => !name.endsWith('.tmp')),
     'no temp files are left behind',
@@ -273,7 +273,7 @@ test('annotations survive a full store round-trip in a temp dir', () => {
 test('save keeps one previous good copy as state.backup.json', () => {
   const file = tempFile('backup')
   const store = new AnnotationStore(file)
-  store.add('sess_b', makeAnnotation({ id: 'ann_one' }))
+  const first = store.add('sess_b', makeAnnotation({ id: 'ann_one' })).annotation.id
   store.add('sess_b', makeAnnotation({ id: 'ann_two', quote: '第二段' }))
 
   const backup = backupPathFor(file)
@@ -282,39 +282,50 @@ test('save keeps one previous good copy as state.backup.json', () => {
   const previous = JSON.parse(fs.readFileSync(backup, 'utf8'))
   assert.deepEqual(
     previous.sessions.sess_b.annotations.map(annotation => annotation.id),
-    ['ann_one'],
+    [first],
   )
 })
 
-test('a corrupt state file is moved aside and treated as empty', () => {
-  const file = tempFile('corrupt')
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, '{ this is not json', 'utf8')
-
-  const warnings = []
-  const store = new AnnotationStore(file, { logger: { warn: message => warnings.push(message) } })
-  assert.deepEqual(store.list('sess_x'), [])
-  assert.ok(warnings.some(message => message.includes('unreadable')))
-  assert.ok(
-    fs.readdirSync(path.dirname(file)).some(name => name.startsWith('state.json.corrupt-')),
-    'the corrupt original is kept as a backup',
-  )
-
-  // The store keeps working and rewrites a valid document.
-  store.add('sess_x', makeAnnotation({ id: 'ann_after_corrupt' }))
-  assert.equal(readState(file).sessions.sess_x.annotations.length, 1)
+test('corrupt or invalid state stops activation without changing state or sweeping materials', () => {
+  for (const body of ['{ this is not json', 'null', '{}', '{"version":2,"sessions":[]}']) {
+    const file = tempFile('corrupt')
+    const materials = path.join(path.dirname(file), 'materials')
+    fs.mkdirSync(materials, { recursive: true })
+    fs.writeFileSync(file, body)
+    fs.writeFileSync(path.join(materials, 'recover-me.txt'), 'precious material')
+    const warnings = []
+    assert.throws(() => new AnnotationStore(file, { logger: { warn: message => warnings.push(message) } }))
+    assert.ok(warnings.some(message => message.includes('unreadable')))
+    assert.equal(fs.readFileSync(file, 'utf8'), body)
+    assert.equal(fs.readFileSync(path.join(materials, 'recover-me.txt'), 'utf8'), 'precious material')
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).sort(), ['materials', 'state.json'])
+  }
 })
 
-test('a save failure is logged but never thrown', () => {
-  const warnings = []
-  const blocker = path.join(tempRoot, 'not-a-directory')
-  fs.writeFileSync(blocker, 'x', 'utf8')
-  const file = path.join(blocker, 'annotations', 'state.json')
-
-  let store
-  assert.doesNotThrow(() => {
-    store = new AnnotationStore(file, { logger: { warn: message => warnings.push(message) } })
+test('non-ENOENT state read failure prevents all persistence and material cleanup', t => {
+  const file = tempFile('unreadable')
+  const materials = path.join(path.dirname(file), 'materials')
+  fs.mkdirSync(materials, { recursive: true })
+  const original = JSON.stringify(emptyState())
+  fs.writeFileSync(file, original)
+  const sentinel = path.join(materials, 'recover-me.txt')
+  fs.writeFileSync(sentinel, 'keep')
+  const read = fs.readFileSync
+  t.mock.method(fs, 'readFileSync', function (target, ...args) {
+    if (target === file) throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    return read.call(this, target, ...args)
   })
+  assert.throws(() => new AnnotationStore(file), { code: 'EACCES' })
+  assert.equal(read(file, 'utf8'), original)
+  assert.equal(read(sentinel, 'utf8'), 'keep')
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).sort(), ['materials', 'state.json'])
+})
+
+test('a post-activation save failure is logged but never thrown', t => {
+  const warnings = []
+  const file = tempFile('write-failure')
+  const store = new AnnotationStore(file, { logger: { warn: message => warnings.push(message) } })
+  t.mock.method(fs, 'writeFileSync', () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }) })
   const added = store.add('sess_fail', makeAnnotation({ id: 'ann_memory_only' }))
   assert.equal(added.deduped, false)
   assert.equal(store.list('sess_fail').length, 1, 'in-memory state stays usable')

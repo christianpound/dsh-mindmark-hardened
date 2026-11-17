@@ -24,7 +24,9 @@ after(() => {
 
 const storeFile = path.join(tempRoot, 'handler', 'annotations', 'state.json')
 const store = new AnnotationStore(storeFile, { logger: { warn() {} } })
-const handler = createAnnotationsHandler({ store, logger: { warn() {} } })
+const peer = { principal: { kind: 'owner' } }
+const connection = { browserPeer: peer, admit: () => ({ peer }) }
+const handler = createAnnotationsHandler({ store, logger: { warn() {} }, connection, sessionExists: () => true })
 
 const SESSION_ID = 'sess_handler_1'
 
@@ -57,7 +59,7 @@ function createReq(method, options = {}) {
       : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')]
   return {
     method,
-    headers,
+    headers: { host: '127.0.0.1:3080', 'x-dsh-mindmark': '1', ...headers },
     url,
     async *[Symbol.asyncIterator]() {
       for (const chunk of chunks) yield chunk
@@ -78,7 +80,7 @@ async function call(req, target = handler) {
 }
 
 function jsonHeaders(extra = {}) {
-  return { 'content-type': 'application/json', ...extra }
+  return { host: '127.0.0.1:3080', 'x-dsh-mindmark': '1', 'content-type': 'application/json', ...extra }
 }
 
 function localStamp(iso) {
@@ -93,21 +95,17 @@ function localStamp(iso) {
 // ------------------------------------------------------------------- route
 
 test('the route path is the contract path and the factory needs a store', () => {
-  assert.equal(ROUTE, '/plugins/dsh-mindmark/annotations')
+  assert.equal(ROUTE, '/plugins/dsh-mindmark-hardened/annotations')
   assert.throws(() => createAnnotationsHandler({}), TypeError)
   assert.throws(() => createAnnotationsHandler(), TypeError)
 })
 
-test('OPTIONS answers a CORS preflight for loopback origins', async () => {
+test('OPTIONS never grants CORS permission even for loopback origins', async () => {
   const response = await call(
     createReq('OPTIONS', { headers: { origin: 'http://127.0.0.1:36715' } }),
   )
-  assert.equal(response.status, 204)
-  assert.equal(response.body, '')
-  assert.equal(response.headers['access-control-allow-origin'], 'http://127.0.0.1:36715')
-  assert.match(response.headers['access-control-allow-methods'], /GET/)
-  assert.match(response.headers['access-control-allow-methods'], /POST/)
-  assert.equal(response.headers.vary, 'Origin')
+  assert.equal(response.status, 403)
+  assert.equal(response.headers['access-control-allow-origin'], undefined)
 })
 
 test('GET an unknown session answers with an empty list, not an error', async () => {
@@ -131,15 +129,15 @@ test('GET rejects a missing or malformed sessionId with Chinese validation error
   }
 })
 
-test('GET adds CORS headers for loopback origins and rejects foreign origins', async () => {
+test('GET permits authenticated same origin without CORS and rejects foreign origins', async () => {
   const allowed = await call(
     createReq('GET', {
       url: `${ROUTE}?sessionId=${SESSION_ID}`,
-      headers: { origin: 'http://127.0.0.1:36715' },
+      headers: { origin: 'http://127.0.0.1:3080' },
     }),
   )
   assert.equal(allowed.status, 200)
-  assert.equal(allowed.headers['access-control-allow-origin'], 'http://127.0.0.1:36715')
+  assert.equal(allowed.headers['access-control-allow-origin'], undefined)
 
   const denied = await call(
     createReq('GET', { url: `${ROUTE}?sessionId=${SESSION_ID}`, headers: { origin: 'https://evil.example' } }),
@@ -166,8 +164,10 @@ test('POST add stores the full wire record and answers with the annotation list'
   assert.equal(response.json.added, true)
   assert.equal(response.json.annotations.length, 1)
   for (const [key, value] of Object.entries(record)) {
-    assert.equal(response.json.annotations[0][key], value)
+    if (key === 'id') assert.notEqual(response.json.annotations[0][key], value)
+    else assert.equal(response.json.annotations[0][key], value)
   }
+  assert.deepEqual(response.json.annotation, response.json.annotations[0])
   assert.deepEqual(store.list(sessionId), response.json.annotations)
 })
 
@@ -377,6 +377,9 @@ test('apply wires the route, the annotations tool, the prompt section and the pr
     const tools = new Map()
     const sections = []
     const ctx = {
+      connection,
+      sessions: { get: () => ({}) },
+      userQuestions: { ask: async () => ({ answers: [] }) },
       logger: { info() {}, warn() {} },
       effect(factory) {
         return factory()
@@ -411,14 +414,14 @@ test('apply wires the route, the annotations tool, the prompt section and the pr
     assert.equal(registrations.length, 1)
     assert.equal(registrations[0].kind, 'exact')
     assert.equal(registrations[0].path, ROUTE)
-    assert.ok(fs.existsSync(path.join(process.env.DSH_HOME, 'annotations', 'state.json')))
+    assert.ok(fs.existsSync(path.join(process.env.DSH_HOME, 'annotations-hardened', 'state.json')))
 
     const routeHandler = routes.get(ROUTE)
     assert.equal(typeof routeHandler, 'function')
 
     const tool = tools.get(TOOL_NAME)
     assert.ok(tool, 'the annotations tool must register')
-    assert.equal(TOOL_NAME, 'annotations')
+    assert.equal(TOOL_NAME, 'mindmark_annotations')
     assert.equal(tool.parameters.type, 'object')
     assert.deepEqual(tool.parameters.properties.action.enum, ['list', 'resolve', 'reopen', 'delete', 'clear', 'set-mode', 'distill', 'lessons', 'forget', 'material'])
     assert.equal(tool.parameters.additionalProperties, false)
@@ -434,7 +437,7 @@ test('apply wires the route, the annotations tool, the prompt section and the pr
 
     const section = sections.find(item => item.name === SECTION_NAME)
     assert.ok(section, 'the annotations prompt section must register')
-    assert.equal(SECTION_NAME, 'tool:annotations')
+    assert.equal(SECTION_NAME, 'tool:mindmark_annotations')
     assert.equal(SECTION_ORDER, 9100)
     assert.equal(section.order, 9100)
 
@@ -461,7 +464,7 @@ test('apply wires the route, the annotations tool, the prompt section and the pr
     const text = section.text({ scope: { id: 'sess_apply' } })
     assert.match(text, /## 用户标注协议/)
     assert.match(text, /当前 1 条/)
-    assert.match(text, /`annotations` 工具/)
+    assert.match(text, /`mindmark_annotations` 工具/)
     assert.equal(section.text({ scope: { id: 'sess_other' } }), '', 'sessions stay isolated')
 
     // The tool reads the same document.

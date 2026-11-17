@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "MindMark",
-    "description": "Show the model your mind: highlight, underline, strike, comment on, rewrite, back with a source or move parts of an answer; the markup reaches the assistant as context on the next turn and it confirms when handled."
+    "title": "MindMark hardened",
+    "description": "Highlight and annotate responses with authenticated access and session-isolated references. Annotations enter the next model turn; global preferences require explicit human confirmation."
   }
 }

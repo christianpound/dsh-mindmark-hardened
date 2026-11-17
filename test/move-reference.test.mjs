@@ -117,7 +117,7 @@ test('materials live in their own files and follow the annotation lifecycle', ()
     anchored('reference', '给出方案 A 和方案 B', { note: '按材料口径改', material: { kind: 'file', title: 'spec.md', content: long } }),
     CAPTURE,
   )
-  const file = store.materialPath(annotation.id)
+  const file = store.materialPath('s1', annotation.id)
   assert.equal(fs.readFileSync(file, 'utf8'), long)
   const state = JSON.parse(fs.readFileSync(store.filePath, 'utf8'))
   assert.ok(!JSON.stringify(state).includes(long), 'state.json keeps only the excerpt')
@@ -135,7 +135,7 @@ test('materials live in their own files and follow the annotation lifecycle', ()
 
   const again = store.add('s1', anchored('reference', '介绍背景', { material: { kind: 'text', content: '短材料' } }), CAPTURE).annotation
   store.clear('s1')
-  assert.equal(fs.existsSync(store.materialPath(again.id)), false)
+  assert.equal(fs.existsSync(store.materialPath('s1', again.id)), false)
 })
 
 test('a re-marked reference takes the new material; orphans are swept on load', () => {
@@ -144,7 +144,7 @@ test('a re-marked reference takes the new material; orphans are swept on load', 
   const first = store.add('s1', base, CAPTURE).annotation
   const second = store.add('s1', { ...base, material: { kind: 'text', title: 't', content: '新的材料' } }, CAPTURE)
   assert.equal(second.deduped, true)
-  assert.equal(fs.readFileSync(store.materialPath(first.id), 'utf8'), '新的材料')
+  assert.equal(fs.readFileSync(store.materialPath('s1', first.id), 'utf8'), '新的材料')
   assert.equal(store.list('s1')[0].material.length, 4)
 
   fs.writeFileSync(path.join(store.materialsDir, 'orphan.txt'), 'x')
@@ -230,8 +230,12 @@ test('the material tool action reads chunks and the HTTP add accepts a material'
   process.env.DSH_HOME = home
   const routes = new Map()
   const tools = new Map()
+  const peer = { principal: { kind: 'owner' } }
   try {
     apply({
+      connection: { browserPeer: peer, admit: () => ({ peer }) },
+      sessions: { get: () => ({}) },
+      userQuestions: { ask: async () => ({ answers: [] }) },
       logger: { info() {}, warn() {} },
       effect: run => run(),
       on() {},
@@ -254,7 +258,7 @@ test('the material tool action reads chunks and the HTTP add accepts a material'
     const req = {
       method: 'POST',
       url: ROUTE,
-      headers: { 'content-type': 'application/json', host: '127.0.0.1' },
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:3080', 'x-dsh-mindmark': '1' },
       async *[Symbol.asyncIterator]() {
         yield* chunks
       },

@@ -1,4 +1,13 @@
-# 更新记录
+# 更新记录 / Changelog
+
+## 0.4.1-hardened.1
+
+- Forked upstream 0.4.0; retained MIT attribution and seven annotation styles.
+- Required DSH browser-owner authentication and same-origin requests; removed permissive CORS.
+- Added session-isolated material paths, server UUIDs, safe map keys and isolated storage.
+- Required explicit human confirmation for model-requested global instruction changes; sanitized delimiters and removed inferred consent.
+- Bound file reads, UI state and DOM anchors to their owning draft/session/message.
+- Added host, storage and client security regressions; documented provider disclosure and retention.
 
 ## v0.4.0
 

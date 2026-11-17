@@ -51,7 +51,7 @@ test('parse/compose keep user content outside the managed block byte for byte', 
   assert.ok(out.includes('- [2026-11-01] 旧偏好\n- [2026-11-16] 新偏好\n' + BLOCK_END))
   assert.ok(out.endsWith('\n\n# Tail\nkeep me\n'))
   // removing every lesson drops the block but keeps the rest
-  assert.equal(composeInstructions(parsed, []), '# My rules\n\nAlways be brief.\n\n# Tail\nkeep me\n')
+  assert.equal(composeInstructions(parsed, []), parsed.before + parsed.after)
   // a file without a block is left untouched
   assert.deepEqual(parseInstructions('plain\n'), { before: 'plain\n', lessons: [], after: '' })
 })
@@ -73,19 +73,78 @@ test('LessonStore adds with dedupe, lists, removes by text or index, and creates
   assert.deepEqual(store.remove('不存在的'), [])
   assert.deepEqual(store.remove(['解释概念时先给具体例子']), ['解释概念时先给具体例子'])
   assert.deepEqual(store.list(), [])
-  assert.equal(fs.readFileSync(file, 'utf8'), '')
+  assert.equal(fs.readFileSync(file, 'utf8'), '\n')
 })
 
-test('LessonStore keeps the newest lessons when the cap is exceeded', () => {
-  const store = new LessonStore(tempFile())
-  store.add(Array.from({ length: MAX_LESSONS + 5 }, (_, i) => `偏好 ${i}`))
-  const lessons = store.list()
-  assert.equal(lessons.length, MAX_LESSONS)
-  assert.equal(lessons[0].text, '偏好 5')
-  assert.equal(lessons[lessons.length - 1].text, `偏好 ${MAX_LESSONS + 4}`)
+test('LessonStore rejects count overflow without evicting existing preferences', () => {
+  const file = tempFile()
+  const store = new LessonStore(file)
+  const original = Array.from({ length: MAX_LESSONS }, (_, i) => `偏好 ${i}`)
+  store.add(original)
+  const before = fs.readFileSync(file, 'utf8')
+  assert.throws(() => store.add('one too many'), { code: 'lesson-budget-exceeded' })
+  assert.equal(fs.readFileSync(file, 'utf8'), before)
+  assert.deepEqual(store.list().map(x => x.text), original)
 })
 
-test('an unreadable file is treated as empty and a user file with other content survives', () => {
+test('LessonStore rejects byte overflow atomically, including direct save', () => {
+  const file = tempFile()
+  const store = new LessonStore(file)
+  store.add('keep this preference')
+  const before = fs.readFileSync(file, 'utf8')
+  const oversized = Array.from({ length: 12 }, (_, i) => `${i}${'偏'.repeat(299)}`)
+  assert.throws(() => store.add(oversized), { code: 'lesson-budget-exceeded' })
+  assert.throws(() => store.save(store.read(), oversized.map(text => ({ text }))), { code: 'lesson-budget-exceeded' })
+  assert.equal(fs.readFileSync(file, 'utf8'), before)
+  assert.deepEqual(store.list().map(x => x.text), ['keep this preference'])
+  const absent = tempFile()
+  assert.throws(() => new LessonStore(absent).add(oversized), { code: 'lesson-budget-exceeded' })
+  assert.equal(fs.existsSync(absent), false)
+})
+
+test('removeExact preserves confirmation identity for numeric text and shifted lists', () => {
+  const file = tempFile()
+  const store = new LessonStore(file)
+  store.add(['first', '2', 'third', 'Case'])
+  const confirmed = store.list()[1].text
+  const concurrent = new LessonStore(file)
+  concurrent.removeExact('first')
+  concurrent.add('newly added')
+  assert.deepEqual(store.removeExact([confirmed]), ['2'])
+  assert.deepEqual(store.list().map(x => x.text), ['third', 'Case', 'newly added'])
+  assert.deepEqual(store.removeExact(['case', ' Case ', 1]), [])
+  const gone = store.list()[0].text
+  concurrent.removeExact(gone)
+  assert.deepEqual(store.removeExact(gone), [])
+  assert.deepEqual(store.list().map(x => x.text), ['Case', 'newly added'])
+})
+
+test('hardened lessons never import or modify the upstream managed block', () => {
+  const file = tempFile()
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const upstream = '# user rules\n\n<!-- dsh-mindmark:start -->\n- upstream preference\n<!-- dsh-mindmark:end -->\n  \n\n'
+  fs.writeFileSync(file, upstream)
+  const store = new LessonStore(file)
+  assert.deepEqual(store.list(), [])
+  store.add('hardened preference')
+  assert.ok(fs.readFileSync(file, 'utf8').startsWith(upstream + BLOCK_START))
+  store.add('another')
+  store.removeExact(['hardened preference', 'another'])
+  assert.equal(fs.readFileSync(file, 'utf8'), upstream + '\n')
+})
+
+test('failed atomic lesson replacement preserves existing bytes and cleans temporary file', t => {
+  const file = tempFile()
+  const store = new LessonStore(file)
+  store.add('original')
+  const before = fs.readFileSync(file, 'utf8')
+  t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }) })
+  assert.throws(() => store.add('not persisted'), /denied/)
+  assert.equal(fs.readFileSync(file, 'utf8'), before)
+  assert.deepEqual(fs.readdirSync(path.dirname(file)), ['AGENTS.md'])
+})
+
+test('a user file with other content survives lesson updates', () => {
   const file = tempFile()
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, '# mine\n\n- rule A\n')

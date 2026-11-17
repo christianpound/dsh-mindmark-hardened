@@ -4,10 +4,10 @@
 // inside one managed block, so the official agent-instructions plugin feeds
 // them to every new session without any extra wiring:
 //
-//   <!-- dsh-mindmark:start -->
-//   ## 用户通过标注沉淀的偏好（dsh-mindmark）
+//   <!-- dsh-mindmark-hardened:start -->
+//   ## 用户通过标注沉淀的偏好（dsh-mindmark-hardened）
 //   - [2026-11-16] 解释概念时先给一个具体例子，再讲原理。
-//   <!-- dsh-mindmark:end -->
+//   <!-- dsh-mindmark-hardened:end -->
 //
 // Everything outside the block is preserved byte for byte. Writes are atomic.
 
@@ -15,9 +15,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-export const BLOCK_START = '<!-- dsh-mindmark:start -->'
-export const BLOCK_END = '<!-- dsh-mindmark:end -->'
-export const BLOCK_TITLE = '## 用户通过标注沉淀的偏好（dsh-mindmark）'
+export const BLOCK_START = '<!-- dsh-mindmark-hardened:start -->'
+export const BLOCK_END = '<!-- dsh-mindmark-hardened:end -->'
+export const BLOCK_TITLE = '## 用户通过标注沉淀的偏好（dsh-mindmark-hardened）'
 export const BLOCK_INTRO = '以下是用户在批改助手回答时反复表现出的偏好，请在所有对话中遵守；与当前对话的明确指示冲突时以当前指示为准。'
 export const MAX_LESSONS = 40
 export const MAX_LESSON_LENGTH = 300
@@ -41,7 +41,7 @@ function today() {
 /** Collapse whitespace and clip one lesson line; '' when unusable. */
 export function normalizeLesson(text) {
   if (typeof text !== 'string') return ''
-  const flat = text.replace(/\s+/g, ' ').trim().replace(/^[-*•]\s*/, '').replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '')
+  const flat = text.replace(/<!--/g, '‹!--').replace(/-->/g, '--›').replace(/\s+/g, ' ').trim().replace(/^[-*•]\s*/, '').replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '')
   return flat.length > MAX_LESSON_LENGTH ? `${flat.slice(0, MAX_LESSON_LENGTH - 1)}…` : flat
 }
 
@@ -50,7 +50,12 @@ export function parseInstructions(body) {
   const text = typeof body === 'string' ? body : ''
   const start = text.indexOf(BLOCK_START)
   const end = start < 0 ? -1 : text.indexOf(BLOCK_END, start)
-  if (start < 0 || end < 0) return { before: text, lessons: [], after: '' }
+  const starts = text.split(BLOCK_START).length - 1
+  const ends = text.split(BLOCK_END).length - 1
+  if (starts !== ends || starts > 1 || (starts === 1 && end < start)) {
+    throw new Error('Ambiguous or incomplete dsh-mindmark lesson markers; refusing to rewrite instructions.')
+  }
+  if (start < 0) return { before: text, lessons: [], after: '' }
   const inner = text.slice(start + BLOCK_START.length, end)
   const lessons = []
   for (const line of inner.split('\n')) {
@@ -59,7 +64,7 @@ export function parseInstructions(body) {
     const lesson = normalizeLesson(m[2])
     if (lesson !== '') lessons.push({ date: m[1] ?? '', text: lesson })
   }
-  return { before: text.slice(0, start), lessons, after: text.slice(end + BLOCK_END.length) }
+  return { before: text.slice(0, start), lessons, after: text.slice(end + BLOCK_END.length), hasBlock: true }
 }
 
 /** Render the managed block for a lesson list ('' when empty). */
@@ -67,7 +72,9 @@ export function renderBlock(lessons) {
   if (!Array.isArray(lessons) || lessons.length === 0) return ''
   const lines = [BLOCK_START, BLOCK_TITLE, '', BLOCK_INTRO, '']
   for (const lesson of lessons) {
-    lines.push(`- ${lesson.date ? `[${lesson.date}] ` : ''}${lesson.text}`)
+    const text = normalizeLesson(lesson.text)
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(lesson.date) ? lesson.date : ''
+    if (text) lines.push(`- ${date ? `[${date}] ` : ''}${text}`)
   }
   lines.push(BLOCK_END)
   return lines.join('\n')
@@ -76,13 +83,11 @@ export function renderBlock(lessons) {
 /** Re-assemble a file body with a new lesson list. */
 export function composeInstructions(parsed, lessons) {
   const block = renderBlock(lessons)
-  const before = parsed.before.replace(/\s+$/, '')
-  const after = parsed.after.replace(/^\s+|\s+$/g, '')
-  if (block === '') {
-    const joined = [before, after].filter(part => part !== '').join('\n\n')
-    return joined === '' ? '' : `${joined}\n`
-  }
-  return [before, block, after].filter(part => part !== '').join('\n\n') + '\n'
+  if (parsed.hasBlock) return parsed.before + block + parsed.after
+  // Appending our first block must not trim or rewrite upstream/user bytes.
+  if (block === '') return parsed.before + parsed.after
+  const separator = parsed.before === '' || parsed.before.endsWith('\n\n') ? '' : parsed.before.endsWith('\n') ? '\n' : '\n\n'
+  return parsed.before + separator + block + '\n' + parsed.after
 }
 
 function ensureDirectory(filePath) {
@@ -95,10 +100,9 @@ function writeAtomic(filePath, text) {
   fs.writeFileSync(temp, text, { encoding: 'utf8', mode: 0o600 })
   try {
     fs.renameSync(temp, filePath)
-  } catch (error) {
-    fs.copyFileSync(temp, filePath)
-    fs.unlinkSync(temp)
-    if (!fs.existsSync(filePath)) throw error
+  } finally {
+    // Never fall back to truncating the user's instructions after rename fails.
+    try { fs.rmSync(temp, { force: true }) } catch { /* Best-effort temp cleanup. */ }
   }
 }
 
@@ -115,7 +119,8 @@ export class LessonStore {
       body = fs.readFileSync(this.filePath, 'utf8')
     } catch (error) {
       if (error?.code !== 'ENOENT') {
-        this.logger?.warn?.(`dsh-mindmark: cannot read ${this.filePath}: ${String(error)}`)
+        this.logger?.warn?.(`dsh-mindmark-hardened: cannot read ${this.filePath}: ${String(error)}`)
+        throw error
       }
     }
     return parseInstructions(body)
@@ -127,10 +132,12 @@ export class LessonStore {
   }
 
   save(parsed, lessons) {
-    let kept = lessons
-    // Keep the block inside its byte budget by dropping the oldest lessons.
-    while (kept.length > MAX_LESSONS || Buffer.byteLength(renderBlock(kept)) > MAX_BLOCK_BYTES) {
-      kept = kept.slice(1)
+    const kept = lessons
+    // Approval for additions does not authorize deleting existing preferences.
+    if (kept.length > MAX_LESSONS || Buffer.byteLength(renderBlock(kept)) > MAX_BLOCK_BYTES) {
+      const error = new Error('Lesson budget exceeded; explicitly remove preferences before adding more.')
+      error.code = 'lesson-budget-exceeded'
+      throw error
     }
     if (kept.length === 0 && parsed.lessons.length === 0 && !fs.existsSync(this.filePath)) return kept
     writeAtomic(this.filePath, composeInstructions(parsed, kept))
@@ -160,6 +167,16 @@ export class LessonStore {
     }
     const lessons = added.length === 0 ? parsed.lessons : this.save(parsed, next)
     return { added, skipped, lessons: lessons.map(lesson => ({ ...lesson })) }
+  }
+
+  /** Remove only literal confirmed texts from the current file, never indices. */
+  removeExact(targets) {
+    const parsed = this.read()
+    const wanted = new Set((Array.isArray(targets) ? targets : [targets]).filter(target => typeof target === 'string'))
+    const removed = parsed.lessons.filter(lesson => wanted.has(lesson.text)).map(lesson => lesson.text)
+    if (removed.length === 0) return []
+    this.save(parsed, parsed.lessons.filter(lesson => !wanted.has(lesson.text)))
+    return removed
   }
 
   /** Remove lessons by exact text or 1-based index. Returns the removed texts. */

@@ -1,7 +1,9 @@
 {
-  "name": "dsh-mindmark",
-  "version": "0.4.0",
-  "description": "Show the model your mind: mark up an answer like in Word (highlight / underline / strike / comment / rewrite / source / move) and your markup reaches DeepSeek Harness as context on the next turn.",
+  "name": "@local/dsh-mindmark-hardened",
+  "version": "0.4.1-hardened.1",
+  "private": true,
+  "engines": { "dsh": ">=0.2.2-rc.1" },
+  "description": "Hardened MindMark fork: response annotations with DSH-authenticated access, session-isolated references, and human-approved global preferences.",
   "type": "module",
   "main": "./index.js",
   "exports": {
@@ -22,7 +24,9 @@
     "LICENSE",
     "docs/demo.gif",
     "CHANGELOG.md",
-    "README.en.md"
+    "README.en.md",
+    "SECURITY.md",
+    "VALIDATION.md"
   ],
   "dsh": {
     "bundle": {
@@ -44,11 +48,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BaiKe-Zhang/dsh-mindmark.git"
+    "url": "git+https://github.com/christianpound/dsh-mindmark-hardened.git"
   },
-  "homepage": "https://github.com/BaiKe-Zhang/dsh-mindmark#readme",
+  "homepage": "https://github.com/christianpound/dsh-mindmark-hardened#readme",
   "bugs": {
-    "url": "https://github.com/BaiKe-Zhang/dsh-mindmark/issues"
+    "url": "https://github.com/christianpound/dsh-mindmark-hardened/issues"
   },
   "author": "BaiKe-Zhang",
   "scripts": {

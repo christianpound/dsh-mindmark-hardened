@@ -24,7 +24,7 @@
 // page (Fn); Harness itself binds no Alt+C / Alt+V.
 //
 // Annotations are text anchors, never host-DOM references: the selection is
-// converted into character offsets over the nearest scroll container, stored as
+// converted into character offsets within its session-owned message, stored as
 // a quote + prefix/suffix + CSS path record on the Host, and re-anchored by
 // scoring every `indexOf(quote)` candidate against the saved context. The same
 // selection is also located inside its message body so the Host can render a
@@ -36,7 +36,7 @@
 // theme tokens and everything is namespaced under the `dsa-` class prefix.
 
 window.__ModuleLoader__.load({
-  id: 'dsh-mindmark',
+  id: '@local/dsh-mindmark-hardened',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -48,7 +48,16 @@ window.__ModuleLoader__.load({
     var useRef = React.useRef
     var useSyncExternalStore = React.useSyncExternalStore
 
-    var ROUTE = '/plugins/dsh-mindmark/annotations'
+    // Each mounted session owns its state, promises, drafts and DOM bindings.
+    function createSessionRuntime(ownerSessionId, runtimeId, locale) {
+    var disposedRuntime = false
+    // Verified ConversationRoot boundary: data-conversation-session encloses
+    // the chat Views and composer. Missing boundaries fail closed.
+    function ownsBody(body) {
+      var seat = body && typeof body.closest === 'function' ? body.closest('[data-conversation-session]') : null
+      return !!seat && seat.getAttribute('data-conversation-session') === ownerSessionId
+    }
+    var ROUTE = '/plugins/dsh-mindmark-hardened/annotations'
     var UI_ATTR = 'data-dsh-mindmark-ui'
     var UI_SELECTOR = '[' + UI_ATTR + ']'
     var CSS_ID = 'dsh-mindmark'
@@ -62,7 +71,7 @@ window.__ModuleLoader__.load({
     var MAX_MATERIAL_FILE_BYTES = 4 * 1024 * 1024
     var MATERIAL_FILE_ACCEPT = '.txt,.md,.markdown,.csv,.tsv,.json,.html,.htm,.xml,.yaml,.yml,.log,.tex,.rst,.srt,text/*'
     var MOVE_EXTRA_HIGHLIGHTS = ['dsa-move-pending', 'dsa-move-replace', 'dsa-ref-pending']
-    var CARET_LAYER_ID = 'dsa-caret-layer'
+    var CARET_LAYER_ID = 'dsa-caret-layer-' + runtimeId
     var MODES = ['brief', 'full']
     var MAX_QUOTE = 2000
     var MAX_NOTE = 2000
@@ -72,7 +81,7 @@ window.__ModuleLoader__.load({
     var ID_MAX = 120
     var MUTATION_DEBOUNCE = 150
     var STATE_REPAINT_DELAY = 60
-    var PANEL_TITLE_ID = 'dsa-annotate-panel-title'
+    var PANEL_TITLE_ID = 'dsa-annotate-panel-title-' + runtimeId
     var SURFACE_KEY = 'dsh-mindmark'
 
     // ------------------------------------------------------------- dictionaries
@@ -161,7 +170,7 @@ window.__ModuleLoader__.load({
         footerHint: '待处理的标注会在下一轮自动送给助手；助手处理后会标为已处理。',
         distill: '沉淀为习惯',
         distillHint: '让助手把这些标注归纳成长期偏好，写进你的全局 AGENTS.md，新对话自动遵守',
-        distillPrompt: '请回顾我在这个对话里做过的全部标注（用 annotations 工具 action=list 查看），归纳出我反复表现出的偏好，每条一句、可直接执行、不要带具体内容，然后用 annotations 工具 action=distill 把它们写入 lessons。写完后把沉淀的偏好列给我看。',
+        distillPrompt: '请回顾我在这个对话里做过的全部标注（用 mindmark_annotations 工具 action=list 查看），归纳出我反复表现出的偏好，每条一句、可直接执行、不要带具体内容，然后用 mindmark_annotations 工具 action=distill 把它们写入 lessons。写完后把沉淀的偏好列给我看。',
         lessonsTitle: '已沉淀的偏好',
         lessonsEmpty: '还没有沉淀过偏好。标注积累几条后，点「沉淀为习惯」让助手归纳。',
         forget: '移除',
@@ -260,7 +269,7 @@ window.__ModuleLoader__.load({
         footerHint: 'Pending annotations are sent to the assistant on the next turn; it marks them handled afterwards.',
         distill: 'Keep as habit',
         distillHint: 'Ask the assistant to distill these annotations into long-term preferences in your global AGENTS.md',
-        distillPrompt: 'Review every annotation I made in this conversation (use the annotations tool with action=list), distill the preferences I keep showing into one actionable sentence each without specific content, then write them with the annotations tool action=distill in lessons. Show me the distilled list afterwards.',
+        distillPrompt: 'Review every annotation I made in this conversation (use the mindmark_annotations tool with action=list), distill the preferences I keep showing into one actionable sentence each without specific content, then write them with the mindmark_annotations tool action=distill in lessons. Show me the distilled list afterwards.',
         lessonsTitle: 'Distilled preferences',
         lessonsEmpty: 'Nothing distilled yet. After a few annotations, click "Keep as habit" to let the assistant summarize them.',
         forget: 'Remove',
@@ -688,19 +697,24 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // The nearest scrollable ancestor of the selection is the indexing root; when
-    // there is none the whole body is. Host class names are never consulted.
+    // A selection belongs to exactly one answer already admitted by its session
+    // interaction owner. Never index a scroll container or the document body.
     function findRoot(range) {
-      try {
-        var current = elementOfNode(range && range.commonAncestorContainer)
-        while (current && current !== document.documentElement) {
-          if (!isOurUiElement(current) && isScrollContainer(current)) return current
-          current = current.parentElement
-        }
-      } catch (error) {
-        console.error('dsh-mindmark: cannot find the selection root', error)
-      }
-      return document.body
+      var body = messageBodyOf(range && range.startContainer)
+      if (!body || body !== messageBodyOf(range.endContainer)) return null
+      return ownsBody(body) ? body : null
+    }
+
+    function admitSelection(props) {
+      if (props.sessionId !== ownerSessionId || typeof props.readText !== 'function') return null
+      var text = props.readText()
+      var range = readLiveRange()
+      // Host readText projects visible block boundaries; it is not range.toString().
+      if (!range || typeof text !== 'string' || !text.trim()) return null
+      var body = messageBodyOf(range.startContainer)
+      if (!body || body !== messageBodyOf(range.endContainer) || !ownsBody(body)) return null
+      // Require both owner-scoped readText and the DOM's explicit session seat.
+      return range
     }
 
     // Raw text-node values in document order (never whitespace-normalized), with
@@ -871,16 +885,21 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function resolveRoot(selector) {
-      try {
-        if (typeof selector === 'string' && selector.length > 0 && selector.length <= SELECTOR_MAX) {
-          var element = document.querySelector(selector)
-          if (element && element.nodeType === 1 && !isOurUiElement(element)) return element
+    function resolveRoot(selector, messageKey) {
+      if (disposedRuntime || typeof messageKey !== 'string' || !messageKey) return null
+      var matches = []
+      var seats = document.querySelectorAll('[data-conversation-session]')
+      for (var seatIndex = 0; seatIndex < seats.length; seatIndex += 1) {
+        var seat = seats[seatIndex]
+        if (seat.getAttribute('data-conversation-session') !== ownerSessionId) continue
+        var bodies = seat.querySelectorAll('[data-text-interaction-source]')
+        for (var bodyIndex = 0; bodyIndex < bodies.length; bodyIndex += 1) {
+          var body = bodies[bodyIndex]
+          if (body.isConnected !== false && ownsBody(body) && messageKeyOf(body, buildIndex(body)) === messageKey && matches.indexOf(body) < 0) matches.push(body)
         }
-      } catch (error) {
-        /* a stale or malformed selector falls back to body */
       }
-      return document.body
+      // Ambiguous or recycled DOM must never paint a different answer/session.
+      return matches.length === 1 ? matches[0] : null
     }
 
     // --------------------------------------------------------- anchoring
@@ -984,12 +1003,13 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function ensureIndexEntry(cache, selector) {
-      var key = typeof selector === 'string' ? selector : ''
+    function ensureIndexEntry(cache, selector, messageKey) {
+      var key = JSON.stringify([selector, messageKey])
       if (hasOwn(cache, key)) return cache[key]
       var entry = null
       try {
-        var root = resolveRoot(key)
+        var root = resolveRoot(selector, messageKey)
+        if (!root) return null
         entry = { root: root, index: buildIndex(root) }
       } catch (error) {
         entry = null
@@ -1004,7 +1024,7 @@ window.__ModuleLoader__.load({
       for (var index = 0; index < annotations.length; index += 1) {
         var annotation = annotations[index]
         try {
-          var entry = ensureIndexEntry(cache, annotation.rootSelector)
+          var entry = ensureIndexEntry(cache, annotation.rootSelector, annotation.messageKey)
           if (entry === null) continue
           var range = locateAnnotationRange(annotation, entry.index)
           if (range !== null) resolved.push({ annotation: annotation, range: range })
@@ -1032,7 +1052,7 @@ window.__ModuleLoader__.load({
         if (!supportsHighlights()) return
         var registry = CSS.highlights
         if (ranges.length === 0) {
-          registry.delete(name)
+          registry.delete(name + '-' + runtimeId)
           return
         }
         var group = null
@@ -1045,7 +1065,7 @@ window.__ModuleLoader__.load({
           group = new Highlight()
           for (var index = 0; index < ranges.length; index += 1) group.add(ranges[index])
         }
-        registry.set(name, group)
+        registry.set(name + '-' + runtimeId, group)
       } catch (error) {
         console.error('dsh-mindmark: cannot paint highlights', error)
       }
@@ -1055,11 +1075,11 @@ window.__ModuleLoader__.load({
       try {
         if (!supportsHighlights()) return
         STYLES.forEach(function (style) {
-          CSS.highlights.delete(highlightName(style, 'pending'))
-          CSS.highlights.delete(highlightName(style, 'resolved'))
+          CSS.highlights.delete(highlightName(style, 'pending') + '-' + runtimeId)
+          CSS.highlights.delete(highlightName(style, 'resolved') + '-' + runtimeId)
         })
         MOVE_EXTRA_HIGHLIGHTS.forEach(function (name) {
-          CSS.highlights.delete(name)
+          CSS.highlights.delete(name + '-' + runtimeId)
         })
         removeCarets()
       } catch (error) {
@@ -1105,17 +1125,17 @@ window.__ModuleLoader__.load({
         for (var moveIndex = 0; moveIndex < annotations.length; moveIndex += 1) {
           var move = annotations[moveIndex]
           if (move.style !== 'move' || move.status === 'resolved') continue
-          markTarget(ensureIndexEntry(cache, move.rootSelector), move.targetPrefix, move.targetQuote, move.targetSuffix, true)
+          markTarget(ensureIndexEntry(cache, move.rootSelector, move.messageKey), move.targetPrefix, move.targetQuote, move.targetSuffix, true)
         }
         var pendingRef = current.referenceDraft
         if (pendingRef && pendingRef.built && current.sessionId !== null) {
-          var refEntry = ensureIndexEntry(cache, pendingRef.built.record.rootSelector)
+          var refEntry = ensureIndexEntry(cache, pendingRef.built.record.rootSelector, pendingRef.built.record.messageKey)
           var refRange = refEntry === null ? null : locateAnnotationRange(pendingRef.built.record, refEntry.index)
           if (refRange !== null) groups['dsa-ref-pending'].push(refRange)
         }
         var pendingMove = current.pendingMove
         if (pendingMove && pendingMove.built && current.sessionId !== null) {
-          var pendingEntry = ensureIndexEntry(cache, pendingMove.built.record.rootSelector)
+          var pendingEntry = ensureIndexEntry(cache, pendingMove.built.record.rootSelector, pendingMove.built.record.messageKey)
           if (pendingEntry !== null) {
             var sourceRange = locateAnnotationRange(pendingMove.built.record, pendingEntry.index)
             if (sourceRange !== null) groups['dsa-move-pending'].push(sourceRange)
@@ -1240,7 +1260,7 @@ window.__ModuleLoader__.load({
         if (!nativeSelection || nativeSelection.rangeCount === 0) return null
         var range = nativeSelection.getRangeAt(0)
         var body = messageBodyOf(range.startContainer)
-        if (!body) return null
+        if (!body || !ownsBody(body) || messageBodyOf(range.endContainer) !== body) return null
         var index = buildIndex(body)
         if (!index.text || index.text.length > MAX_MESSAGE_TEXT) return null
         var offset = offsetOf(index, range.startContainer, range.startOffset)
@@ -1362,6 +1382,7 @@ window.__ModuleLoader__.load({
     function buildRecord(range, style) {
       try {
         var root = findRoot(range)
+        if (!root) return null
         var index = buildIndex(root)
         if (!index.text || index.nodes.length === 0) return null
         var start = offsetOf(index, range.startContainer, range.startOffset)
@@ -1370,6 +1391,7 @@ window.__ModuleLoader__.load({
         var quote = index.text.slice(start, end)
         if (!quote || quote.trim().length === 0 || quote.length > MAX_QUOTE) return null
         var message = locateMessage(range)
+        if (!message) return null
         var record = {
           id: createClientId(),
           style: isStyle(style) ? style : 'highlight',
@@ -1411,7 +1433,7 @@ window.__ModuleLoader__.load({
       var cache = {}
       for (var index = 0; index < current.annotations.length; index += 1) {
         var annotation = current.annotations[index]
-        var entry = ensureIndexEntry(cache, annotation.rootSelector)
+        var entry = ensureIndexEntry(cache, annotation.rootSelector, annotation.messageKey)
         if (entry === null) continue
         var annotationRange = locateAnnotationRange(annotation, entry.index)
         if (annotationRange !== null && rangesIntersect(annotationRange, range)) hits.push(annotation.id)
@@ -1422,7 +1444,7 @@ window.__ModuleLoader__.load({
     // -------------------------------------------------------------- controller
 
     var state = {
-      sessionId: null,
+      sessionId: ownerSessionId,
       annotations: [],
       mode: 'brief',
       lessons: [],
@@ -1437,6 +1459,12 @@ window.__ModuleLoader__.load({
     var stateListeners = new Set()
     var loadToken = 0
     var mutationQueue = Promise.resolve()
+    var pendingAdds = new Map()
+    var serverIds = new Map()
+
+    function resolvedIds(ids) {
+      return ids.map(function (id) { return serverIds.get(id) || id })
+    }
 
     function getState() {
       return state
@@ -1450,6 +1478,7 @@ window.__ModuleLoader__.load({
     }
 
     function publishState(patch) {
+      if (disposedRuntime) return
       var next = {}
       for (var key in state) next[key] = state[key]
       for (var patchKey in patch) next[patchKey] = patch[patchKey]
@@ -1585,6 +1614,9 @@ window.__ModuleLoader__.load({
       var pending = null
       try {
         if (typeof fetch !== 'function') return Promise.reject(networkFailure(new Error('fetch is unavailable')))
+        if (disposedRuntime) return Promise.reject(networkFailure(new Error('session disposed')))
+        if (url !== ROUTE && url.indexOf(ROUTE + '?') !== 0) throw new Error('unexpected endpoint')
+        options = Object.assign({}, options, { credentials: 'same-origin', redirect: 'error', headers: Object.assign({}, options && options.headers, { 'x-dsh-mindmark': '1' }) })
         pending = fetch(url, options)
       } catch (failure) {
         return Promise.reject(networkFailure(failure))
@@ -1675,7 +1707,12 @@ window.__ModuleLoader__.load({
 
     function applyServerPayload(data, extra) {
       var patch = extra || {}
-      if (Array.isArray(data.annotations)) patch.annotations = normalizeAnnotationList(data.annotations)
+      if (Array.isArray(data.annotations)) {
+        patch.annotations = normalizeAnnotationList(data.annotations)
+        pendingAdds.forEach(function (record) {
+          if (!patch.annotations.some(function (item) { return item.id === record.id })) patch.annotations.push(record)
+        })
+      }
       if (typeof data.mode === 'string') patch.mode = normalizeMode(data.mode)
       if (Array.isArray(data.lessons)) patch.lessons = normalizeLessons(data.lessons)
       if (patch.error === undefined) patch.error = null
@@ -1702,21 +1739,9 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // Session identity is immutable. A seat cannot retarget another seat's work.
     function setCurrentSession(rawSessionId) {
-      var sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : null
-      if (sessionId === state.sessionId) return
-      loadToken += 1
-      publishState({
-        sessionId: sessionId,
-        annotations: [],
-        mode: 'brief',
-        loading: sessionId !== null,
-        error: null,
-        panelOpen: sessionId === null ? false : state.panelOpen,
-        pendingMove: null,
-        referenceDraft: null,
-      })
-      if (sessionId !== null) loadSession(sessionId)
+      if (rawSessionId !== ownerSessionId || disposedRuntime) return
     }
 
     function reload() {
@@ -1742,6 +1767,7 @@ window.__ModuleLoader__.load({
         return
       }
       loadToken += 1
+      pendingAdds.set(record.id, record)
       publishState({ annotations: state.annotations.concat([record]), loading: false, error: null })
       // The wire copy comes from the raw record: it still carries the material text.
       var body = { action: 'add', sessionId: sessionId, annotation: wireRecord(annotation) }
@@ -1749,11 +1775,14 @@ window.__ModuleLoader__.load({
       enqueueMutation(function () {
         return postAction(body).then(
           function (data) {
-            if (state.sessionId !== sessionId) return
+            if (state.sessionId !== sessionId || disposedRuntime) return
+            pendingAdds.delete(record.id)
+            if (data.annotation && typeof data.annotation.id === 'string') serverIds.set(record.id, data.annotation.id)
             applyServerPayload(data)
           },
           function (failure) {
-            if (state.sessionId !== sessionId) return
+            pendingAdds.delete(record.id)
+            if (state.sessionId !== sessionId || disposedRuntime) return
             publishState({
               annotations: state.annotations.filter(function (item) {
                 return item.id !== record.id
@@ -1766,7 +1795,7 @@ window.__ModuleLoader__.load({
     }
 
     function uniqueIds(ids) {
-      var seen = {}
+      var seen = Object.create(null)
       var unique = []
       if (!Array.isArray(ids)) return unique
       for (var index = 0; index < ids.length; index += 1) {
@@ -1784,7 +1813,7 @@ window.__ModuleLoader__.load({
       if (sessionId === null) return
       var unique = uniqueIds(ids)
       if (unique.length === 0) return
-      var seen = {}
+      var seen = Object.create(null)
       unique.forEach(function (id) {
         seen[id] = true
       })
@@ -1801,14 +1830,14 @@ window.__ModuleLoader__.load({
         error: null,
       })
       enqueueMutation(function () {
-        return postAction({ action: 'remove', sessionId: sessionId, ids: unique }).then(
+        return postAction({ action: 'remove', sessionId: sessionId, ids: resolvedIds(unique) }).then(
           function (data) {
             if (state.sessionId !== sessionId) return
             applyServerPayload(data)
           },
           function (failure) {
             if (state.sessionId !== sessionId) return
-            var present = {}
+            var present = Object.create(null)
             state.annotations.forEach(function (item) {
               present[item.id] = true
             })
@@ -1871,7 +1900,7 @@ window.__ModuleLoader__.load({
       loadToken += 1
       publishState({ annotations: next, loading: false, error: null })
       enqueueMutation(function () {
-        return postAction({ action: status === 'resolved' ? 'resolve' : 'reopen', sessionId: sessionId, ids: unique }).then(
+        return postAction({ action: status === 'resolved' ? 'resolve' : 'reopen', sessionId: sessionId, ids: resolvedIds(unique) }).then(
           function (data) {
             if (state.sessionId !== sessionId) return
             applyServerPayload(data)
@@ -1971,17 +2000,49 @@ window.__ModuleLoader__.load({
     function startReference(built) {
       if (state.sessionId === null || !built || !built.record) return
       publishState({
-        referenceDraft: { built: built, kind: 'text', title: '', content: '', url: '', fileName: '', text: '', error: '' },
+        referenceDraft: { token: {}, fileGeneration: 0, built: built, kind: 'text', title: '', content: '', url: '', fileName: '', text: '', error: '' },
       })
     }
 
     function patchReference(patch) {
       if (!state.referenceDraft) return
+      if (patch.kind && patch.kind !== state.referenceDraft.kind) patch = copyOf(patch, { fileGeneration: state.referenceDraft.fileGeneration + 1 })
       publishState({ referenceDraft: copyOf(state.referenceDraft, patch) })
     }
 
     function cancelReference() {
       if (state.referenceDraft) publishState({ referenceDraft: null })
+    }
+
+    // Identity and generation guard every callback, including errors and a
+    // second chooser result. Editing the title does not invalidate a read.
+    function readReferenceFile(file, t, expectedToken) {
+      var draft = state.referenceDraft
+      if (!file || !draft || draft.kind !== 'file' || disposedRuntime || (expectedToken && draft.token !== expectedToken)) return
+      var token = draft.token
+      var generation = draft.fileGeneration + 1
+      patchReference({ fileGeneration: generation, content: '', fileName: '', error: '' })
+      function currentDraft() {
+        var current = state.referenceDraft
+        return !disposedRuntime && current && current.token === token && current.fileGeneration === generation && current.kind === 'file' ? current : null
+      }
+      function fail(key) {
+        if (currentDraft()) patchReference({ error: t(key, { max: MAX_MATERIAL }), content: '', fileName: '' })
+      }
+      if (typeof file.size === 'number' && file.size > MAX_MATERIAL_FILE_BYTES) { fail('refTooLong'); return }
+      try {
+        var reader = new FileReader()
+        reader.onload = function () {
+          var current = currentDraft()
+          if (!current) return
+          var text = typeof reader.result === 'string' ? reader.result : ''
+          if (text.indexOf('\u0000') >= 0 || !text.trim()) fail('refFileError')
+          else if (text.length > MAX_MATERIAL) fail('refTooLong')
+          else patchReference({ content: text, fileName: file.name, title: current.title || file.name, error: '' })
+        }
+        reader.onerror = function () { fail('refFileError') }
+        reader.readAsText(file)
+      } catch (error) { fail('refFileError') }
     }
 
     // Returns an error dictionary key, or '' once the reference is saved.
@@ -2136,7 +2197,7 @@ window.__ModuleLoader__.load({
       }
 
       function mark(style) {
-        var range = readLiveRange()
+        var range = admitSelection(props)
         if (range === null) {
           dismiss()
           return
@@ -2168,7 +2229,7 @@ window.__ModuleLoader__.load({
       }
 
       function unmark() {
-        var range = readLiveRange()
+        var range = admitSelection(props)
         if (range === null) {
           dismiss()
           return
@@ -2207,7 +2268,7 @@ window.__ModuleLoader__.load({
         var isRewrite = draft.style === 'rewrite'
         return h(
           'div',
-          { className: 'dsa-toolbar is-note', role: 'dialog', 'aria-label': t(draft.style), 'data-dsh-mindmark-ui': '1' },
+          { className: 'dsa-toolbar is-note', role: 'dialog', 'aria-label': t(draft.style), 'data-dsh-mindmark-ui': String(runtimeId) },
           h(
             'div',
             { className: 'dsa-note-head' },
@@ -2267,7 +2328,7 @@ window.__ModuleLoader__.load({
         var canReplace = pendingTarget !== null && Boolean(pendingTarget.quote) && !current.pendingMove.error
         return h(
           'div',
-          { className: 'dsa-toolbar', role: 'toolbar', 'aria-label': t('move'), 'data-dsh-mindmark-ui': '1' },
+          { className: 'dsa-toolbar', role: 'toolbar', 'aria-label': t('move'), 'data-dsh-mindmark-ui': String(runtimeId) },
           canReplace
             ? h(ToolButton, {
                 label: t('movePlaceReplace'),
@@ -2315,7 +2376,7 @@ window.__ModuleLoader__.load({
       }
       return h(
         'div',
-        { className: 'dsa-toolbar is-rows', role: 'toolbar', 'aria-label': t('toolbarLabel'), 'data-dsh-mindmark-ui': '1' },
+        { className: 'dsa-toolbar is-rows', role: 'toolbar', 'aria-label': t('toolbarLabel'), 'data-dsh-mindmark-ui': String(runtimeId) },
         h(
           'div',
           { className: 'dsa-tool-row' },
@@ -2374,7 +2435,7 @@ window.__ModuleLoader__.load({
       var locked = props.locked === true
       return h(
         'div',
-        { className: 'dsa-mode', 'data-dsh-mindmark-ui': '1', title: t('modeTitle'), role: 'group', 'aria-label': t('modeLabel') },
+        { className: 'dsa-mode', 'data-dsh-mindmark-ui': String(runtimeId), title: t('modeTitle'), role: 'group', 'aria-label': t('modeLabel') },
         h('span', { className: 'dsa-mode-label' }, h(MarkerIcon, { size: 13 }), h('span', null, t('modeLabel'))),
         h(
           'span',
@@ -2737,33 +2798,7 @@ window.__ModuleLoader__.load({
 
       function readFile(event) {
         var input = event && event.target
-        var file = input && input.files && input.files[0]
-        if (!file) return
-        if (typeof file.size === 'number' && file.size > MAX_MATERIAL_FILE_BYTES) {
-          patch({ error: t('refTooLong', { max: MAX_MATERIAL }), content: '', fileName: '' })
-          return
-        }
-        try {
-          var reader = new FileReader()
-          reader.onload = function () {
-            var text = typeof reader.result === 'string' ? reader.result : ''
-            var current = controller.getState().referenceDraft
-            if (!current) return
-            if (text.indexOf('\u0000') >= 0 || text.trim().length === 0) {
-              patch({ error: t('refFileError'), content: '', fileName: '' })
-            } else if (text.length > MAX_MATERIAL) {
-              patch({ error: t('refTooLong', { max: MAX_MATERIAL }), content: '', fileName: '' })
-            } else {
-              patch({ content: text, fileName: file.name, title: current.title || file.name, error: '' })
-            }
-          }
-          reader.onerror = function () {
-            patch({ error: t('refFileError') })
-          }
-          reader.readAsText(file)
-        } catch (error) {
-          patch({ error: t('refFileError') })
-        }
+        readReferenceFile(input && input.files && input.files[0], t, draft.token)
       }
 
       var source
@@ -2880,7 +2915,7 @@ window.__ModuleLoader__.load({
       if (!current.panelOpen && !moving && !referencing) return null
       return h(
         'div',
-        { className: 'dsa-layer', 'data-dsh-mindmark-ui': '1' },
+        { className: 'dsa-layer', 'data-dsh-mindmark-ui': String(runtimeId) },
         current.panelOpen ? h(AnnotationPanel, { t: t, state: current, canHighlight: supportsHighlights() }) : null,
         moving && !referencing ? h(MoveBanner, { t: t, pending: current.pendingMove }) : null,
         referencing ? h(ReferenceDialog, { t: t, draft: current.referenceDraft }) : null,
@@ -2894,9 +2929,7 @@ window.__ModuleLoader__.load({
       useEffect(
         function () {
           controller.setCurrentSession(sessionId)
-          return function () {
-            controller.setCurrentSession(null)
-          }
+          return function () {}
         },
         [sessionId],
       )
@@ -2908,7 +2941,7 @@ window.__ModuleLoader__.load({
         'button',
         {
           type: 'button',
-          'data-dsh-mindmark-ui': '1',
+          'data-dsh-mindmark-ui': String(runtimeId),
           className: 'dsa-header-btn' + (panelOpen ? ' is-active' : ''),
           title: title,
           'aria-label': title,
@@ -3006,6 +3039,20 @@ window.__ModuleLoader__.load({
 
       function onKeyDown(event) {
         if (disposed || !event) return
+        var targetElement = elementOfNode(event.target)
+        var ui = targetElement && targetElement.closest(UI_SELECTOR)
+        if (ui) {
+          if (ui.getAttribute(UI_ATTR) !== String(runtimeId)) return
+        } else if (!ownsBody(targetElement)) {
+          // Non-focusable answer text leaves keyboard focus on body. In that
+          // case use the live range's explicit session, never a global current.
+          if (targetElement !== document.body && targetElement !== document.documentElement) return
+          var selection = typeof window.getSelection === 'function' ? window.getSelection() : null
+          if (!selection || selection.rangeCount !== 1) return
+          var selectedRange = selection.getRangeAt(0)
+          var selectedBody = messageBodyOf(selectedRange.startContainer)
+          if (!selectedBody || !ownsBody(selectedBody) || selectedBody !== messageBodyOf(selectedRange.endContainer)) return
+        }
         var code = event.code
         if (
           event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
@@ -3115,13 +3162,40 @@ window.__ModuleLoader__.load({
       if (typeof document === 'undefined') return function () {}
       var tag = document.createElement('style')
       tag.setAttribute('data-plugin-css', CSS_ID)
-      tag.textContent = CSS_TEXT
+      tag.textContent = CSS_TEXT.replace(/::highlight\(([^)]+)\)/g, function (_, name) { return '::highlight(' + name + '-' + runtimeId + ')' })
       var mount = document.head || document.documentElement
       if (!mount) return function () {}
       mount.appendChild(tag)
       return function () {
         if (tag.parentNode !== null) tag.parentNode.removeChild(tag)
       }
+    }
+
+    if (locale && typeof locale.getSnapshot === 'function' && typeof locale.subscribe === 'function') localeService = locale
+    var stopRuntime = null
+    var stopStyles = null
+    return {
+      SelectionActions: WithTranslate(SelectionActions),
+      ModeSwitch: WithTranslate(ModeSwitch),
+      AnnotationHeader: WithTranslate(AnnotationHeader),
+      AnnotationOverlay: WithTranslate(AnnotationOverlay),
+      start: function () {
+        if (stopRuntime) return
+        stopStyles = installStyles()
+        stopRuntime = installRuntime()
+        loadSession(ownerSessionId)
+      },
+      dispose: function () {
+        disposedRuntime = true
+        loadToken += 1
+        state.referenceDraft = null
+        if (stopRuntime) stopRuntime()
+        if (stopStyles) stopStyles()
+        pendingAdds.clear()
+        serverIds.clear()
+        stateListeners.clear()
+      },
+    }
     }
 
     function injectSlot(slots, name, options, component) {
@@ -3154,21 +3228,56 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       var locale = getService(ctx, 'locale')
-      if (locale && typeof locale.getSnapshot === 'function' && typeof locale.subscribe === 'function') {
-        localeService = locale
+      var runtimes = new Map()
+      var serial = 0
+      var listeners = new Set()
+      var snapshot = []
+      function changed() { snapshot = Array.from(runtimes.values()); listeners.forEach(function (f) { f() }) }
+      function subscribe(f) { listeners.add(f); return function () { listeners.delete(f) } }
+      function getSnapshot() { return snapshot }
+      function SessionSeat(props) {
+        var sessionId = props.sessionId
+        var holder = useState(null)
+        useEffect(function () {
+          if (typeof sessionId !== 'string' || !sessionId) return
+          var entry = runtimes.get(sessionId)
+          if (!entry) {
+            entry = { sessionId: sessionId, refs: 0, runtime: createSessionRuntime(sessionId, ++serial, locale) }
+            runtimes.set(sessionId, entry)
+            entry.runtime.start()
+            changed()
+          }
+          entry.refs += 1
+          holder[1](entry)
+          return function () {
+            entry.refs -= 1
+            if (!entry.refs) {
+              entry.runtime.dispose()
+              runtimes.delete(sessionId)
+              changed()
+            }
+          }
+        }, [sessionId])
+        var entry = holder[0]
+        if (!entry || entry.sessionId !== sessionId) return null
+        return h(entry.runtime[props.component], props)
       }
-
-      try {
-        if (ctx && typeof ctx.effect === 'function') {
-          ctx.effect(installStyles, 'dsh-mindmark: styles')
-          ctx.effect(installRuntime, 'dsh-mindmark: re-anchoring runtime')
-        } else {
-          installStyles()
-          installRuntime()
+      function seat(component) {
+        return function (props) { return h(SessionSeat, Object.assign({}, props, { component: component })) }
+      }
+      function Overlays() {
+        var entries = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+        return h(React.Fragment, null, entries.map(function (entry) {
+          return h(entry.runtime.AnnotationOverlay, { key: entry.sessionId })
+        }))
+      }
+      if (ctx && typeof ctx.effect === 'function') ctx.effect(function () {
+        return function () {
+          runtimes.forEach(function (entry) { entry.runtime.dispose() })
+          runtimes.clear()
+          changed()
         }
-      } catch (error) {
-        console.error('dsh-mindmark: cannot install the client runtime', error)
-      }
+      }, 'dsh-mindmark-hardened: session runtimes')
 
       var slots = getService(ctx, 'slots')
       if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
@@ -3176,7 +3285,7 @@ window.__ModuleLoader__.load({
         return
       }
 
-      var actions = WithTranslate(SelectionActions)
+      var actions = seat('SelectionActions')
       // Take over the Quote plugin's selection surface (it still admits the
       // gesture and we keep Quote as the first action) …
       injectSlot(
@@ -3189,7 +3298,7 @@ window.__ModuleLoader__.load({
       injectSlot(
         slots,
         'conversation.chat.text-interaction',
-        { name: 'conversation.chat.text-interaction', key: SURFACE_KEY },
+        { name: 'conversation.chat.text-interaction', key: 'dsh-mindmark-hardened' },
         actions,
       )
       var conversation = getService(ctx, 'uiConversation')
@@ -3198,7 +3307,7 @@ window.__ModuleLoader__.load({
           ctx.effect(
             function () {
               return conversation.interactions.register({
-                id: SURFACE_KEY,
+                id: 'dsh-mindmark-hardened',
                 onInteraction: function (request) {
                   if (request.trigger !== 'selection' || request.readText() === null) return
                   request.open()
@@ -3216,19 +3325,19 @@ window.__ModuleLoader__.load({
         slots,
         'conversation.input.left',
         { name: 'conversation.input.left', id: 'dsh-mindmark.mode', order: 60 },
-        WithTranslate(ModeSwitch),
+        seat('ModeSwitch'),
       )
       injectSlot(
         slots,
         'conversation.session.header.utilities',
         { name: 'conversation.session.header.utilities', id: 'dsh-mindmark', order: 40 },
-        WithTranslate(AnnotationHeader),
+        seat('AnnotationHeader'),
       )
       injectSlot(
         slots,
         'shell.overlay',
         { name: 'shell.overlay', id: 'dsh-mindmark.overlay', order: 40 },
-        WithTranslate(AnnotationOverlay),
+        Overlays,
       )
     }
 

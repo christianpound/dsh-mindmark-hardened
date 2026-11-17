@@ -7,8 +7,8 @@
 #   defaultMode:   'brief' | 'full'   (per-session switch in the composer overrides it)
 #   maxInjections: integer            (turns an unresolved annotation is re-sent before it settles)
 - insert:
-    - id: dsh-mindmark
-      name: 'dsh-mindmark'
+    - id: dsh-mindmark-hardened
+      name: '@local/dsh-mindmark-hardened'
       config:
         defaultMode: brief
         maxInjections: 3

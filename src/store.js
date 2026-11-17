@@ -15,16 +15,18 @@
 //   }
 //
 // Writes are atomic (temp + rename with retry) and a copy of the previous good
-// document is retained as `state.backup.json`. Loading never throws: a corrupt
-// file is moved aside and treated as empty. Saving never throws either — a
+// document is retained as `state.backup.json`. Unreadable or corrupt state
+// aborts activation unchanged for explicit recovery. Saving never throws — a
 // failed save is reported through the optional logger and the in-memory state
 // stays usable, so the HTTP boundary can never emit an unhandled rejection.
 
 import fs from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 
 export const STATE_VERSION = 2
+export const MAX_SESSIONS = 1000
 export const MAX_ANNOTATIONS_PER_SESSION = 300
 export const MAX_ID_LENGTH = 80
 export const MAX_QUOTE_LENGTH = 2000
@@ -59,13 +61,13 @@ export class AnnotateInputError extends Error {
   }
 }
 
-/** Resolve `$DSH_HOME/annotations/state.json` (or `%USERPROFILE%\.dsh/...`). */
+/** Resolve `$DSH_HOME/annotations-hardened/state.json`; never import upstream state. */
 export function resolveStatePath(env = process.env) {
   const home =
     typeof env?.DSH_HOME === 'string' && env.DSH_HOME.trim() !== ''
       ? env.DSH_HOME
       : path.join(os.homedir(), '.dsh')
-  return path.join(home, 'annotations', 'state.json')
+  return path.join(home, 'annotations-hardened', 'state.json')
 }
 
 /** Empty-but-valid document. */
@@ -73,13 +75,18 @@ export function emptyState() {
   return { version: STATE_VERSION, sessions: {} }
 }
 
+// Define own keys without invoking Object.prototype.__proto__ setters.
+function setOwn(object, key, value) {
+  Object.defineProperty(object, key, { value, writable: true, enumerable: true, configurable: true })
+}
+
 function truncate(value, max) {
   return typeof value === 'string' ? value.slice(0, max) : ''
 }
 
-/** Server-side id for a record whose client omitted `id`. */
+/** Server-generated cryptographic id; client IDs are temporary UI hints only. */
 export function generateAnnotationId() {
-  return `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+  return `ann_${randomUUID()}`
 }
 
 /**
@@ -256,7 +263,7 @@ export function validateAnnotationInput(raw) {
   if (
     typeof raw.quote !== 'string' ||
     raw.quote.trim().length < 1 ||
-    raw.quote.trim().length > MAX_QUOTE_LENGTH
+    raw.quote.length > MAX_QUOTE_LENGTH
   ) {
     throw new AnnotateInputError(
       'invalid-annotation-quote',
@@ -278,21 +285,13 @@ export function validateAnnotationInput(raw) {
     )
   }
 
-  let id
-  if (raw.id === undefined || raw.id === null || raw.id === '') {
-    id = generateAnnotationId()
-  } else if (typeof raw.id === 'string') {
-    id = raw.id.trim().slice(0, MAX_ID_LENGTH)
-    if (id === '') id = generateAnnotationId()
-  } else {
-    throw new AnnotateInputError('invalid-annotation-id', '标注 ID 必须是字符串。')
-  }
+  const id = generateAnnotationId()
 
   let createdAt
   if (raw.createdAt === undefined || raw.createdAt === null) {
     createdAt = new Date().toISOString()
   } else if (typeof raw.createdAt === 'string' && raw.createdAt.trim() !== '') {
-    createdAt = raw.createdAt
+    createdAt = raw.createdAt.slice(0, 40)
   } else {
     throw new AnnotateInputError('invalid-annotation-created-at', '标注时间格式不正确。')
   }
@@ -306,9 +305,8 @@ export function validateAnnotationInput(raw) {
     messageEnd !== undefined &&
     messageEnd > messageStart
 
-  // Keep harmless unknown fields from newer/older clients; the known fields win.
+  // Persist only explicitly supported fields; unknown client payloads are untrusted.
   const record = {
-    ...raw,
     id,
     style: raw.style,
     quote: raw.quote,
@@ -369,7 +367,7 @@ function normalizeStoredAnnotation(raw) {
   if (!ANNOTATION_STYLES.includes(raw.style)) return null
   if (typeof raw.quote !== 'string') return null
   const quoteLength = raw.quote.trim().length
-  if (quoteLength < 1 || quoteLength > MAX_QUOTE_LENGTH) return null
+  if (quoteLength < 1 || raw.quote.length > MAX_QUOTE_LENGTH) return null
   if (typeof raw.createdAt !== 'string' || raw.createdAt.trim() === '') return null
   const messageKey = truncate(raw.messageKey, MAX_MESSAGE_KEY_LENGTH)
   const messageStart = optionalInteger(raw.messageStart)
@@ -379,7 +377,6 @@ function normalizeStoredAnnotation(raw) {
   const injections = optionalInteger(raw.injections) ?? 0
   const status = ANNOTATION_STATUSES.includes(raw.status) ? raw.status : 'pending'
   const record = withAnchor({
-    ...raw,
     id: truncate(raw.id.trim(), MAX_ID_LENGTH),
     style: raw.style,
     quote: raw.quote,
@@ -388,17 +385,18 @@ function normalizeStoredAnnotation(raw) {
     suffix: truncate(raw.suffix, MAX_CONTEXT_LENGTH),
     rootSelector: truncate(raw.rootSelector, MAX_ROOT_SELECTOR_LENGTH),
     messageKey: anchored ? messageKey : '',
-    createdAt: raw.createdAt,
+    createdAt: raw.createdAt.slice(0, 40),
     status,
     injections,
   }, anchored ? messageStart : undefined, anchored ? messageEnd : undefined, optionalInteger(raw.turn))
   if (status === 'resolved') {
-    record.resolvedAt = typeof raw.resolvedAt === 'string' ? raw.resolvedAt : raw.createdAt
+    record.resolvedAt = (typeof raw.resolvedAt === 'string' ? raw.resolvedAt : raw.createdAt).slice(0, 40)
     record.resolvedBy = typeof raw.resolvedBy === 'string' ? raw.resolvedBy.slice(0, 20) : 'user'
   } else {
     delete record.resolvedAt
     delete record.resolvedBy
   }
+  if (optionalInteger(raw.lastInjectedTurn) !== undefined) record.lastInjectedTurn = optionalInteger(raw.lastInjectedTurn)
   if (record.lastInjectedTurn !== undefined && optionalInteger(record.lastInjectedTurn) === undefined) {
     delete record.lastInjectedTurn
   }
@@ -432,7 +430,7 @@ function normalizeStoredMessages(raw, annotations) {
   for (const [key, value] of Object.entries(raw)) {
     if (!referenced.has(key)) continue
     const message = validateMessageInput({ ...(value ?? {}), key })
-    if (message !== null) messages[key] = { text: message.text, ...(message.turn === undefined ? {} : { turn: message.turn }) }
+    if (message !== null) setOwn(messages, key, { text: message.text, ...(message.turn === undefined ? {} : { turn: message.turn }) })
   }
   return messages
 }
@@ -476,6 +474,7 @@ export function normalizeState(raw) {
         ? raw.sessions
         : {}
     for (const [sessionId, sessionRaw] of Object.entries(sessions)) {
+      if (Object.keys(state.sessions).length >= MAX_SESSIONS) break
       if (
         typeof sessionId !== 'string' ||
         sessionId.trim() === '' ||
@@ -484,7 +483,7 @@ export function normalizeState(raw) {
         continue
       }
       const session = normalizeStoredSession(sessionRaw)
-      if (session !== null) state.sessions[sessionId] = session
+      if (session !== null) setOwn(state.sessions, sessionId, session)
     }
   } catch {
     // `normalizeState` never throws; a partially normalized document is fine.
@@ -521,39 +520,29 @@ function ensureDirectory(filePath) {
 }
 
 /**
- * Load a document. A missing file means an empty document; a corrupt file is
- * copied aside (`state.json.corrupt-<ts>`) instead of being silently
- * overwritten. Never throws.
+ * Only ENOENT means a fresh store. Any unreadable/corrupt document stops
+ * activation before persist or material sweep; recovery must be explicit.
  */
 export function loadStateFile(filePath, { logger } = {}) {
-  try {
-    ensureDirectory(filePath)
-  } catch (error) {
-    logger?.warn?.(`dsh-mindmark: cannot create the annotation directory: ${String(error)}`)
-    return emptyState()
-  }
   let raw
   try {
     raw = fs.readFileSync(filePath, 'utf8')
   } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      logger?.warn?.(`dsh-mindmark: cannot read ${filePath}: ${String(error)}`)
-    }
-    return emptyState()
+    if (error?.code === 'ENOENT') return emptyState()
+    logger?.warn?.(`dsh-mindmark: cannot read ${filePath}: ${String(error)}`)
+    throw error
   }
   try {
-    return normalizeState(JSON.parse(raw))
-  } catch (error) {
-    const backup = `${filePath}.corrupt-${Date.now()}`
-    try {
-      fs.copyFileSync(filePath, backup)
-    } catch {
-      // Best effort: the unreadable original remains in place.
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) ||
+        parsed.version !== STATE_VERSION || parsed.sessions === null ||
+        typeof parsed.sessions !== 'object' || Array.isArray(parsed.sessions)) {
+      throw new Error('Invalid annotation state document; explicit recovery required.')
     }
-    logger?.warn?.(
-      `dsh-mindmark: annotation state was unreadable (${String(error)}); backup at ${backup}`,
-    )
-    return emptyState()
+    return normalizeState(parsed)
+  } catch (error) {
+    logger?.warn?.(`dsh-mindmark: annotation state was unreadable (${String(error)}); original preserved`)
+    throw error
   }
 }
 
@@ -636,28 +625,33 @@ export class AnnotationStore {
 
   // ------------------------------------------------------------ materials
 
-  materialPath(id) {
-    return path.join(this.materialsDir, `${String(id).replace(/[^A-Za-z0-9_-]/g, '_')}.txt`)
+  materialPath(sessionId, id) {
+    validateSessionId(sessionId)
+    if (typeof id !== 'string' || !/^ann_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      throw new AnnotateInputError('invalid-annotation-id', '标注 ID 无效。')
+    }
+    const sessionHash = createHash('sha256').update(sessionId).digest('hex')
+    return path.join(this.materialsDir, `${sessionHash}_${id}.txt`)
   }
 
-  writeMaterial(id, content) {
+  writeMaterial(sessionId, id, content) {
     fs.mkdirSync(this.materialsDir, { recursive: true })
-    fs.writeFileSync(this.materialPath(id), content, { encoding: 'utf8', mode: 0o600 })
+    fs.writeFileSync(this.materialPath(sessionId, id), content, { encoding: 'utf8', mode: 0o600 })
   }
 
-  readMaterialFile(id) {
+  readMaterialFile(sessionId, id) {
     try {
-      return fs.readFileSync(this.materialPath(id), 'utf8')
+      return fs.readFileSync(this.materialPath(sessionId, id), 'utf8')
     } catch {
       return undefined
     }
   }
 
-  deleteMaterials(records) {
+  deleteMaterials(sessionId, records) {
     for (const record of records) {
       if (record?.style !== 'reference') continue
       try {
-        fs.rmSync(this.materialPath(record.id), { force: true })
+        fs.rmSync(this.materialPath(sessionId, record.id), { force: true })
       } catch (error) {
         this.logger?.warn?.(`dsh-mindmark: cannot delete material ${record.id}: ${String(error)}`)
       }
@@ -673,9 +667,11 @@ export class AnnotationStore {
       return
     }
     const keep = new Set()
-    for (const session of Object.values(this.state.sessions)) {
+    for (const [sessionId, session] of Object.entries(this.state.sessions)) {
       for (const item of session?.annotations ?? []) {
-        if (item.style === 'reference') keep.add(path.basename(this.materialPath(item.id)))
+        if (item.style === 'reference') {
+          try { keep.add(path.basename(this.materialPath(sessionId, item.id))) } catch { /* Invalid stored ID has no material. */ }
+        }
       }
     }
     for (const name of names) {
@@ -699,7 +695,7 @@ export class AnnotationStore {
     if (meta.kind === 'url') {
       return { id, kind: 'url', title: meta.title, url: meta.url, total: 0, offset: 0, content: '', nextOffset: -1 }
     }
-    const content = this.readMaterialFile(id)
+    const content = this.readMaterialFile(sessionId, id)
     if (content === undefined) return undefined
     const start = Math.max(0, Math.min(Number.isInteger(offset) ? offset : 0, content.length))
     const size = Number.isInteger(limit) && limit > 0 ? Math.min(limit, MATERIAL_CHUNK_CHARS) : MATERIAL_CHUNK_CHARS
@@ -717,7 +713,7 @@ export class AnnotationStore {
 
   /** Session id -> safe session object, or undefined. */
   sessionFor(sessionId) {
-    if (typeof sessionId !== 'string') return undefined
+    if (typeof sessionId !== 'string' || !Object.hasOwn(this.state.sessions, sessionId)) return undefined
     const session = this.state.sessions[sessionId]
     if (
       session === null ||
@@ -736,8 +732,11 @@ export class AnnotationStore {
     const key = validateSessionId(sessionId)
     let session = this.sessionFor(key)
     if (session === undefined) {
+      if (Object.keys(this.state.sessions).length >= MAX_SESSIONS) {
+        throw new AnnotateInputError('session-limit', `最多保存 ${MAX_SESSIONS} 个会话。`)
+      }
       session = { annotations: [], messages: {} }
-      this.state.sessions[key] = session
+      setOwn(this.state.sessions, key, session)
     }
     return session
   }
@@ -774,7 +773,7 @@ export class AnnotationStore {
   /** The captured full text of one message, or undefined. */
   messageOf(sessionId, messageKey) {
     const session = this.sessionFor(sessionId)
-    if (session === undefined || typeof messageKey !== 'string' || messageKey === '') return undefined
+    if (session === undefined || typeof messageKey !== 'string' || !Object.hasOwn(session.messages, messageKey)) return undefined
     const message = session.messages[messageKey]
     if (message === null || typeof message !== 'object' || typeof message.text !== 'string') return undefined
     return { ...message }
@@ -789,7 +788,7 @@ export class AnnotationStore {
     for (const item of annotations) {
       if (item.style !== 'reference' || item.material.kind === 'url') continue
       if (item.material.length > MATERIAL_INLINE_CHARS) continue
-      const content = this.readMaterialFile(item.id)
+      const content = this.readMaterialFile(sessionId, item.id)
       if (content !== undefined) materials[item.id] = content
     }
     return {
@@ -815,12 +814,12 @@ export class AnnotationStore {
     const session = this.ensureSession(sessionId)
     const capture = validateMessageInput(message)
     if (capture !== null && record.messageKey === capture.key) {
-      session.messages[capture.key] = {
+      setOwn(session.messages, capture.key, {
         text: capture.text,
         ...(capture.turn === undefined ? {} : { turn: capture.turn }),
-      }
+      })
       if (record.turn === undefined && capture.turn !== undefined) record.turn = capture.turn
-    } else if (record.messageKey !== '' && session.messages[record.messageKey] === undefined) {
+    } else if (record.messageKey !== '' && !Object.hasOwn(session.messages, record.messageKey)) {
       // Anchored to a message we never captured: keep the offsets harmless.
       record.messageKey = ''
       delete record.messageStart
@@ -872,14 +871,14 @@ export class AnnotationStore {
       session.annotations.push({ ...record })
       if (session.annotations.length > MAX_ANNOTATIONS_PER_SESSION) {
         const dropped = session.annotations.splice(0, session.annotations.length - MAX_ANNOTATIONS_PER_SESSION)
-        this.deleteMaterials(dropped)
+        this.deleteMaterials(sessionId, dropped)
       }
       stored = record
       result = { annotation: { ...record }, deduped: false }
     }
     if (material !== null) {
       try {
-        this.writeMaterial(stored.id, material.content)
+        this.writeMaterial(sessionId, stored.id, material.content)
       } catch (error) {
         // Without its material a new reference is meaningless: undo it.
         if (!result.deduped) session.annotations = session.annotations.filter(item => item.id !== stored.id)
@@ -912,7 +911,7 @@ export class AnnotationStore {
     if (removed > 0) {
       this.pruneMessages(session)
       this.persist()
-      this.deleteMaterials(dropped)
+      this.deleteMaterials(sessionId, dropped)
     }
     return removed
   }
@@ -927,7 +926,7 @@ export class AnnotationStore {
     session.messages = {}
     if (removed > 0) {
       this.persist()
-      this.deleteMaterials(dropped)
+      this.deleteMaterials(sessionId, dropped)
     }
     return removed
   }
