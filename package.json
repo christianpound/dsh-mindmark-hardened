@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-mindmark-hardened",
-  "version": "0.4.1-hardened.1",
+  "version": "0.4.1-hardened.2",
   "private": true,
   "engines": { "dsh": ">=0.2.2-rc.1" },
   "description": "Hardened MindMark fork: response annotations with DSH-authenticated access, session-isolated references, and human-approved global preferences.",

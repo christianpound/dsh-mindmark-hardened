@@ -30,10 +30,10 @@ function harness() {
   }
   const instrumented = source
     .replace('    exports.apply = apply', '    exports.createSessionRuntime = createSessionRuntime\n    exports.apply = apply')
-    .replace('      SelectionActions: WithTranslate(SelectionActions),', `      test: { controller, readReferenceFile, resolveRoot, findRoot, admitSelection, buildRecord, caretTarget, applyServerPayload, postAction, loadSession, STYLES, whenIdle: function () { return mutationQueue } },
+    .replace('      SelectionActions: WithTranslate(SelectionActions),', `      test: { translate, localeRevision, subscribeLocale, controller, readReferenceFile, resolveRoot, findRoot, admitSelection, buildRecord, caretTarget, applyServerPayload, postAction, loadSession, STYLES, whenIdle: function () { return mutationQueue } },
       SelectionActions: WithTranslate(SelectionActions),`)
   vm.runInNewContext(instrumented, context, { filename: 'client.js' })
-  function runtime(id = 'A', serial = 1) { return plugin.createSessionRuntime(id, serial, null) }
+  function runtime(id = 'A', serial = 1, locale = null) { return plugin.createSessionRuntime(id, serial, locale) }
   function message(sessionId, key, text = 'same quote') {
     const seat = { getAttribute: () => sessionId, querySelectorAll: () => [body] }
     const item = { getAttribute: name => name === 'data-chat-node-key' ? key : null }
@@ -59,6 +59,38 @@ const t = key => key
 function fileDraft(runtime) { runtime.test.controller.startReference(built()); runtime.test.controller.patchReference({ kind: 'file' }) }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
 function reply(request, data) { request.resolve({ ok: true, status: 200, text: async () => JSON.stringify({ ok: true, ...data }) }) }
+
+test('annotation controls default to English when locale is missing or fails', () => {
+  const h = harness()
+  for (const locale of [null, { subscribe() {}, getSnapshot() { return {} } },
+    { subscribe() {}, getSnapshot() { throw new Error('unavailable') } }]) {
+    const r = h.runtime('A', 1, locale)
+    assert.equal(r.test.translate('modeLabel'), 'Annotation feed')
+    assert.equal(r.test.translate('modeBrief'), 'Brief')
+    assert.equal(r.test.translate('modeFull'), 'Full')
+    assert.match(r.test.translate('distillPrompt'), /^Review every annotation/)
+  }
+  assert.match(source, /exports\.inject = \['slots', 'locale'\]/)
+})
+
+test('annotation controls follow live DSH locale changes without changing preferences', () => {
+  const h = harness()
+  let snapshot = { active: 'en', revision: 1 }, listener, calls = 0
+  const locale = {
+    getSnapshot: () => snapshot,
+    subscribe(fn) { listener = fn; return () => { listener = null } },
+  }
+  const r = h.runtime('A', 1, locale)
+  const stop = r.test.subscribeLocale(() => calls++)
+  assert.equal(r.test.translate('modeBrief'), 'Brief')
+  snapshot = { active: 'zh-CN', revision: 2 }; listener()
+  assert.equal(r.test.translate('modeLabel'), '标注注入')
+  assert.equal(r.test.localeRevision(), 2)
+  snapshot = { active: 'en-GB', revision: 3 }; listener()
+  assert.equal(r.test.translate('modeLabel'), 'Annotation feed')
+  assert.equal(calls, 2)
+  stop(); assert.equal(listener, null)
+})
 
 test('file completion cannot modify a replacement or cancelled reference draft', () => {
   const h = harness(), r = h.runtime()

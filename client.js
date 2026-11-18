@@ -294,7 +294,7 @@ window.__ModuleLoader__.load({
         return function () {}
       },
       getSnapshot: function () {
-        return { active: 'zh', revision: 0 }
+        return { active: 'en', revision: 0 }
       },
     }
     var localeService = fallbackLocale
@@ -324,12 +324,12 @@ window.__ModuleLoader__.load({
     }
 
     function translate(key, vars) {
-      var active = 'zh'
+      var active = 'en'
       try {
         var snapshot = localeService.getSnapshot()
         if (snapshot && typeof snapshot.active === 'string') active = snapshot.active
       } catch (error) {
-        active = 'zh'
+        active = 'en'
       }
       var dict = String(active).toLowerCase().indexOf('zh') === 0 ? DICT.zh : DICT.en
       var value = dict[key]
@@ -3342,7 +3342,8 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
-    exports.inject = ['slots']
+    // Wait for the host locale service instead of capturing a startup fallback.
+    exports.inject = ['slots', 'locale']
     return module.exports
   },
 })

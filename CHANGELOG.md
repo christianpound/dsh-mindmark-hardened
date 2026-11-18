@@ -1,5 +1,11 @@
 # 更新记录 / Changelog
 
+## 0.4.1-hardened.2
+
+- Explicitly depend on the Client locale service so annotation controls follow DSH's language setting.
+- Default to English, rather than Chinese, when locale information is absent or fails.
+- Added regression tests for fallback labels, habit prompts and live language changes.
+
 ## 0.4.1-hardened.1
 
 - Forked upstream 0.4.0; retained MIT attribution and seven annotation styles.
